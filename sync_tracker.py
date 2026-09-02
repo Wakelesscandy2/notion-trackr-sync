@@ -53,39 +53,75 @@ def get_existing_roles(data_source_id):
         
     return existing
 
+def parse_utc_date(date_val):
+    """Safely parses strings, numbers, or ISO timestamps into a UTC-aware datetime object."""
+    if not date_val:
+        return None
+    if isinstance(date_val, (int, float)):
+        return datetime.fromtimestamp(date_val / 1000 if date_val > 1e11 else date_val, tz=timezone.utc)
+    
+    date_str = str(date_val).strip()
+    if not date_str:
+        return None
+        
+    date_str_clean = date_str.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(date_str_clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+            try:
+                dt = datetime.strptime(date_str[:10], fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+    return None
+
 def is_job_open(job):
-    """Evaluates status string and UTC timestamps to ensure only active roles are added."""
+    """
+    Evaluates boolean flags, status strings, and UTC date boundaries to 
+    strictly guarantee only currently OPEN roles are added.
+    """
     now = datetime.now(timezone.utc)
     
-    # 1. Filter out explicitly non-open statuses
-    status = (job.get("status") or "").strip().lower()
-    if status in ["closed", "coming_soon", "upcoming", "archived"]:
-        return False
-        
-    # 2. Check if the opening date is in the future
-    opening_date_str = job.get("openingDate")
-    if opening_date_str:
-        try:
-            opening_date = datetime.fromisoformat(opening_date_str.replace("Z", "+00:00"))
-            if opening_date > now:
-                return False
-        except ValueError:
-            pass
+    # 1. Check boolean flags across potential API field names
+    for bool_key in ["isOpen", "is_open", "open", "applicationsOpen"]:
+        val = job.get(bool_key)
+        if val is False:
+            return False
 
-    # 3. Check if the closing date has already passed
-    closing_date_str = job.get("closingDate")
-    if closing_date_str:
-        try:
-            closing_date = datetime.fromisoformat(closing_date_str.replace("Z", "+00:00"))
-            if closing_date < now:
-                return False
-        except ValueError:
-            pass
-            
+    # 2. Reject negative keywords in status strings
+    status_raw = str(job.get("status") or job.get("applicationStatus") or job.get("state") or "").strip().lower()
+    negative_keywords = ["closed", "close", "coming", "soon", "upcoming", "unopen", "not_open", "not open", "archived", "draft", "tbd", "paused"]
+    if any(neg in status_raw for neg in negative_keywords):
+        return False
+
+    # 3. Date boundary enforcement
+    opening_date = parse_utc_date(job.get("openingDate") or job.get("openDate") or job.get("applicationsOpenDate"))
+    closing_date = parse_utc_date(job.get("closingDate") or job.get("closeDate") or job.get("applicationsCloseDate"))
+
+    # Must not open in the future
+    if opening_date and opening_date > now:
+        return False
+
+    # Must not have closed in the past
+    if closing_date and closing_date < now:
+        return False
+
+    # 4. Strict requirement: If status string exists, it must explicitly contain 'open'
+    if status_raw and "open" not in status_raw:
+        return False
+
+    # 5. Default safety check if no dates or status exist
+    if not opening_date and not status_raw and not any(job.get(k) is True for k in ["isOpen", "is_open", "open"]):
+        return False
+
     return True
 
-def add_notion_row(data_source_id, company, role, link, industry, logo_domain, opening_date):
-    """Pushes an open role into Notion with properties, date, and logo icon."""
+def add_notion_row(data_source_id, company, role, link, industry, logo_domain, opening_date_str):
+    """Pushes an open role into Notion with properties, opening date, and logo icon."""
     payload = {
         "parent": {"data_source_id": data_source_id},
         "properties": {
@@ -94,7 +130,7 @@ def add_notion_row(data_source_id, company, role, link, industry, logo_domain, o
             "Job Link": {"url": link if link else None},
             "Industry": {"multi_select": [{"name": industry}]},
             "Status": {"select": {"name": "Not Applied"}},
-            "Opening Date": {"date": {"start": opening_date} if opening_date else None}
+            "Opening Date": {"date": {"start": opening_date_str} if opening_date_str else None}
         }
     }
     
@@ -132,9 +168,9 @@ def sync():
             role = job.get("name", "").strip()
             link = job.get("url", "")
             
-            # Format opening date as YYYY-MM-DD for Notion Date property
-            opening_date_raw = job.get("openingDate")
-            opening_date = opening_date_raw[:10] if opening_date_raw else None
+            # Format parsed opening date as YYYY-MM-DD for Notion
+            opening_dt = parse_utc_date(job.get("openingDate") or job.get("openDate") or job.get("applicationsOpenDate"))
+            opening_date_str = opening_dt.strftime("%Y-%m-%d") if opening_dt else None
             
             # Use company domain for consistent logo retrieval
             careers_site = company_info.get("careersSite", "")
@@ -145,10 +181,10 @@ def sync():
             
             identifier = f"{company.lower()}|{role.lower()}"
             if identifier not in existing:
-                add_notion_row(data_source_id, company, role, link, industry, logo_domain, opening_date)
+                add_notion_row(data_source_id, company, role, link, industry, logo_domain, opening_date_str)
                 existing.add(identifier)
                 added += 1
-                print(f"Added: {company} - {role} (Opened: {opening_date})")
+                print(f"Added: {company} - {role} (Opened: {opening_date_str})")
                 
         print(f"Sync complete. {added} new open roles added. ({skipped} unopened/closed roles skipped)")
     else:
