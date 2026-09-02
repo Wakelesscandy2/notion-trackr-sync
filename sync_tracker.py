@@ -1,9 +1,10 @@
 import os
 import requests
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from notion_client import Client
 
-# Credentials and Endpoints
+# Environment Credentials and Target API
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 DATABASE_ID = os.environ.get("DATABASE_ID")
 TRACKR_API_URL = "https://api.the-trackr.com/programmes?region=UK&industry=Finance&season=2027&type=summer-internships"
@@ -11,7 +12,7 @@ TRACKR_API_URL = "https://api.the-trackr.com/programmes?region=UK&industry=Finan
 notion = Client(auth=NOTION_TOKEN)
 
 def get_domain(url):
-    """Extracts the root domain to fetch Clearbit logos."""
+    """Extracts the root domain from a given URL."""
     if not url:
         return None
     try:
@@ -21,12 +22,12 @@ def get_domain(url):
         return None
 
 def get_data_source_id():
-    """Retrieves the underlying data source ID from the database container."""
+    """Retrieves the underlying data source ID required by modern Notion API versions."""
     db_info = notion.databases.retrieve(database_id=DATABASE_ID)
     return db_info["data_sources"][0]["id"]
 
 def get_existing_roles(data_source_id):
-    """Fetches all existing roles using the new data_sources endpoint."""
+    """Fetches existing roles from Notion to avoid adding duplicate entries."""
     existing = set()
     has_more = True
     next_cursor = None
@@ -52,9 +53,39 @@ def get_existing_roles(data_source_id):
         
     return existing
 
-def add_notion_row(data_source_id, company, role, link, industry):
-    """Pushes a new job opening to Notion using the updated parent container ID."""
-    domain = get_domain(link)
+def is_job_open(job):
+    """Evaluates status string and UTC timestamps to ensure only active roles are added."""
+    now = datetime.now(timezone.utc)
+    
+    # 1. Filter out explicitly non-open statuses
+    status = (job.get("status") or "").strip().lower()
+    if status in ["closed", "coming_soon", "upcoming", "archived"]:
+        return False
+        
+    # 2. Check if the opening date is in the future
+    opening_date_str = job.get("openingDate")
+    if opening_date_str:
+        try:
+            opening_date = datetime.fromisoformat(opening_date_str.replace("Z", "+00:00"))
+            if opening_date > now:
+                return False
+        except ValueError:
+            pass
+
+    # 3. Check if the closing date has already passed
+    closing_date_str = job.get("closingDate")
+    if closing_date_str:
+        try:
+            closing_date = datetime.fromisoformat(closing_date_str.replace("Z", "+00:00"))
+            if closing_date < now:
+                return False
+        except ValueError:
+            pass
+            
+    return True
+
+def add_notion_row(data_source_id, company, role, link, industry, logo_domain, opening_date):
+    """Pushes an open role into Notion with properties, date, and logo icon."""
     payload = {
         "parent": {"data_source_id": data_source_id},
         "properties": {
@@ -62,21 +93,22 @@ def add_notion_row(data_source_id, company, role, link, industry):
             "Role / Programme": {"rich_text": [{"text": {"content": role}}]},
             "Job Link": {"url": link if link else None},
             "Industry": {"multi_select": [{"name": industry}]},
-            "Status": {"select": {"name": "Not Applied"}}
+            "Status": {"select": {"name": "Not Applied"}},
+            "Opening Date": {"date": {"start": opening_date} if opening_date else None}
         }
     }
     
-    if domain:
+    if logo_domain:
         payload["icon"] = {
             "type": "external",
-            "external": {"url": f"https://logo.clearbit.com/{domain}"}
+            "external": {"url": f"https://www.google.com/s2/favicons?domain={logo_domain}&sz=128"}
         }
     
     notion.pages.create(**payload)
 
 def sync():
-    """Pulls live data from Trackr and pushes new roles to Notion."""
-    print("Authenticating and fetching data source ID...")
+    """Main execution function to fetch Trackr jobs and sync active roles into Notion."""
+    print("Authenticating and fetching Notion data source ID...")
     data_source_id = get_data_source_id()
     
     existing = get_existing_roles(data_source_id)
@@ -87,29 +119,38 @@ def sync():
         data = res.json()
         jobs_list = data.get("programmes", [])
         added = 0
+        skipped = 0
         
         for job in jobs_list:
-            # Extract nested company name
-            company_info = job.get("company")
-            company = company_info.get("name", "Unknown").strip() if company_info else "Unknown"
+            if not is_job_open(job):
+                skipped += 1
+                continue
+
+            company_info = job.get("company") or {}
+            company = company_info.get("name", "Unknown").strip()
             
-            # Extract role name and link
             role = job.get("name", "").strip()
             link = job.get("url", "")
             
-            # Extract Industry/Category logic
+            # Format opening date as YYYY-MM-DD for Notion Date property
+            opening_date_raw = job.get("openingDate")
+            opening_date = opening_date_raw[:10] if opening_date_raw else None
+            
+            # Use company domain for consistent logo retrieval
+            careers_site = company_info.get("careersSite", "")
+            logo_domain = get_domain(careers_site) or get_domain(link)
+            
             categories = job.get("categories", [])
             industry = categories[0] if categories else job.get("industry", "Finance")
             
-            # Prevent duplicates
             identifier = f"{company.lower()}|{role.lower()}"
             if identifier not in existing:
-                add_notion_row(data_source_id, company, role, link, industry)
+                add_notion_row(data_source_id, company, role, link, industry, logo_domain, opening_date)
                 existing.add(identifier)
                 added += 1
-                print(f"Added: {company} - {role}")
+                print(f"Added: {company} - {role} (Opened: {opening_date})")
                 
-        print(f"Sync complete. {added} new roles added.")
+        print(f"Sync complete. {added} new open roles added. ({skipped} unopened/closed roles skipped)")
     else:
         print(f"Failed to fetch data from Trackr. Status Code: {res.status_code}")
 
